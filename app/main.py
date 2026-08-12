@@ -1,10 +1,23 @@
 # pyrefly: ignore [missing-import]
+from app.queue.idempotency import is_new_delivery
+# pyrefly: ignore [missing-import]
 from fastapi import FastAPI, HTTPException, Request
-
+from contextlib import asynccontextmanager
 from app.config import settings
 from app.github.webhook import verify_github_signature
+from app.jobs.schemas import ReviewJob
+from app.queue.redis import create_redis_pool
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.redis = await create_redis_pool()
+
+    yield
+
+    await app.state.redis.close()
+
+
+app = FastAPI(lifespan=lifespan)
 
 REVIEW_ACTIONS = {
     "opened",
@@ -52,7 +65,40 @@ async def github_webhook(request: Request):
             "status": "ignored",
             "reason": f"unsupported action: {action}",
         }
+    delivery_id = request.headers.get("X-GitHub-Delivery")
+    if not delivery_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing delivery ID",
+        )
+    
+    if not await is_new_delivery(
+        request.app.state.redis,
+        delivery_id,
+    ):
+        return {
+        "status": "ignored",
+        "reason": "duplicate delivery",
+    }
+
+    pull_request = data["pull_request"]
+    repository = data["repository"]
+
+    job = ReviewJob(
+        repository=repository["full_name"],
+        pr_number=pull_request["number"],
+        head_sha=pull_request["head"]["sha"],
+        base_sha=pull_request["base"]["sha"],
+        event=action,
+        delivery_id=delivery_id,
+    )
+
+    arq_job = await request.app.state.redis.enqueue_job(
+        "process_review",
+        job.model_dump(),
+    )
+
     return {
         "status": "accepted",
-        "action": action,
+        "job": job.model_dump(),
     }
